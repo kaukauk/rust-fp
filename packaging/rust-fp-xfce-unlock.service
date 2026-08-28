@@ -1,0 +1,15 @@
+[Unit]
+Description=Fingerprint touch-to-unlock for XFCE (via logind UnlockSession)
+After=graphical-session.target
+# The graphical logind session may not exist yet when the user manager starts;
+# the daemon exits and is restarted until it does, so never give up.
+StartLimitIntervalSec=0
+
+[Service]
+ExecStart=/usr/bin/rust-fp-xfce-unlock
+Type=exec
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

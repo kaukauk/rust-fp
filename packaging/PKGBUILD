@@ -1,0 +1,53 @@
+# Local package: fingerprint support for the ChromeOS FPMCU (/dev/cros_fp) found
+# on this ThinkPad C13 Yoga Chromebook (board MORPHIUS). libfprint/fprintd have
+# no driver for this sensor, so this packages ChocolateLoverRaj's rust-fp plus
+# two local additions: an XFCE touch-to-unlock daemon and a settings panel.
+
+pkgname=rust-fp-cros
+pkgver=1.0.0
+pkgrel=1
+pkgdesc="Fingerprint enrolment and screen unlock for ChromeOS FPMCU devices, with an XFCE settings panel"
+arch=('x86_64')
+url="https://github.com/ChocolateLoverRaj/rust-fp"
+# Upstream ships no LICENSE file and declares no license in its manifests.
+license=('custom:unknown')
+depends=('gtk3' 'python' 'python-gobject' 'pam' 'systemd-libs')
+makedepends=('cargo' 'clang')
+backup=()
+source=("$pkgname-$pkgver.tar.gz"
+        'rust-fp-dbus-interface.service'
+        'rust-fp-xfce-unlock.service'
+        'rust-fp-settings.desktop')
+sha256sums=('SKIP' 'SKIP' 'SKIP' 'SKIP')
+
+build() {
+  cd "$srcdir/$pkgname-$pkgver"
+  export CARGO_TARGET_DIR=target
+  cargo build --release --locked
+}
+
+package() {
+  cd "$srcdir/$pkgname-$pkgver"
+
+  install -Dm755 target/release/rust-fp             "$pkgdir/usr/bin/rust-fp"
+  install -Dm755 target/release/rust-fp-dbus-interface "$pkgdir/usr/bin/rust-fp-dbus-interface"
+  install -Dm755 target/release/rust-fp-xfce-unlock "$pkgdir/usr/bin/rust-fp-xfce-unlock"
+  install -Dm755 xfce-settings/rust-fp-settings     "$pkgdir/usr/bin/rust-fp-settings"
+
+  # Built and installed, but deliberately not referenced by any PAM stack. XFCE
+  # has a single auth stack for xfce4-screensaver, so enabling this would block
+  # the password path. Unlocking goes through logind instead.
+  install -Dm755 target/release/librust_fp_pam_module.so \
+    "$pkgdir/usr/lib/security/librust_fp_pam_module.so"
+
+  install -Dm644 dbus-interface/org.rust_fp.RustFp.conf \
+    "$pkgdir/usr/share/dbus-1/system.d/org.rust_fp.RustFp.conf"
+
+  install -Dm644 "$srcdir/rust-fp-dbus-interface.service" \
+    "$pkgdir/usr/lib/systemd/system/rust-fp-dbus-interface.service"
+  install -Dm644 "$srcdir/rust-fp-xfce-unlock.service" \
+    "$pkgdir/usr/lib/systemd/user/rust-fp-xfce-unlock.service"
+
+  install -Dm644 "$srcdir/rust-fp-settings.desktop" \
+    "$pkgdir/usr/share/applications/rust-fp-settings.desktop"
+}

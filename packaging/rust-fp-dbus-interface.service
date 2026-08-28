@@ -1,0 +1,12 @@
+[Unit]
+Description=rust-fp D-Bus interface (ChromeOS FPMCU fingerprint access)
+Documentation=https://github.com/ChocolateLoverRaj/rust-fp
+
+[Service]
+ExecStart=/usr/bin/rust-fp-dbus-interface
+Type=exec
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
