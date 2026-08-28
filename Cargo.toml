@@ -1,3 +1,3 @@
 [workspace]
-members = ["pam-module", "cli", "common", "dbus-interface", "rust-fp"]
+members = ["pam-module", "cli", "common", "dbus-interface", "rust-fp", "xfce-unlock"]
 resolver = "2"
