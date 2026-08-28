@@ -1,0 +1,14 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Fingerprint
+GenericName=Fingerprint
+Comment=Enrol fingerprints and unlock the screen with the fingerprint reader
+Exec=rust-fp-settings
+Icon=auth-fingerprint
+Terminal=false
+StartupNotify=true
+Categories=XFCE;GTK;Settings;DesktopSettings;X-XFCE-SettingsDialog;X-XFCE-HardwareSettings;
+Keywords=fingerprint;finger;biometric;unlock;lock screen;login;security;enrol;enroll;
+OnlyShowIn=XFCE;
+X-XfcePluggable=true

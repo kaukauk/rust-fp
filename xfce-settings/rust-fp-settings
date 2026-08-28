@@ -1,0 +1,436 @@
+#!/usr/bin/env python3
+"""Fingerprint settings panel for the XFCE Settings Manager.
+
+Drives the `rust-fp` CLI rather than speaking to org.rust_fp.RustFp directly:
+the wire formats are postcard (enrolment) and msgpack (the template file), and
+the CLI already handles both correctly.
+
+Supports --socket-id so the XFCE Settings Manager can embed this panel in its
+own window, the same way the stock dialogs behave.
+"""
+
+import re
+import shutil
+import sys
+import subprocess
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+from gi.repository import Gtk, Gio, GLib  # noqa: E402
+
+CLI = shutil.which("rust-fp") or "/usr/bin/rust-fp"
+UNLOCK_UNIT = "rust-fp-xfce-unlock.service"
+FP_SERVICE = "rust-fp-dbus-interface.service"
+
+# The CLI prints labels through Rust's {:#?}, so they arrive quoted. Labels are
+# restricted at entry time (see VALID_LABEL) so a naive unquote is safe here.
+QUOTED = re.compile(r'"((?:[^"\\]|\\.)*)"')
+PROGRESS = re.compile(r"Enroll progress: (\d+)%")
+VALID_LABEL = re.compile(r"^[\w][\w ()-]{0,30}$")
+
+
+def cli(*args):
+    """Run the rust-fp CLI synchronously. Returns (ok, output)."""
+    try:
+        done = subprocess.run(
+            [CLI, *args], capture_output=True, text=True, timeout=15
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        return False, str(e)
+    return done.returncode == 0, (done.stdout + done.stderr).strip()
+
+
+def systemctl_user(*args):
+    try:
+        done = subprocess.run(
+            ["systemctl", "--user", *args], capture_output=True, text=True, timeout=15
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        return False, str(e)
+    return done.returncode == 0, (done.stdout + done.stderr).strip()
+
+
+def list_fingerprints():
+    ok, out = cli("list")
+    if not ok:
+        return None
+    return QUOTED.findall(out)
+
+
+def max_templates():
+    ok, out = cli("get-max-templates")
+    if ok:
+        m = re.search(r"(\d+)", out)
+        if m:
+            return int(m.group(1))
+    return None
+
+
+def sensor_ready():
+    ok, _ = systemctl_user("is-active", "--quiet", FP_SERVICE)
+    if ok:
+        return True
+    # The matching daemon is a system service, not a user one.
+    try:
+        done = subprocess.run(
+            ["systemctl", "is-active", "--quiet", FP_SERVICE], timeout=10
+        )
+        return done.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def pick_icon(*names):
+    theme = Gtk.IconTheme.get_default()
+    for name in names:
+        if theme.has_icon(name):
+            return name
+    return "dialog-password"
+
+
+class EnrollDialog(Gtk.Dialog):
+    """Runs `rust-fp add <label>` and mirrors its progress."""
+
+    def __init__(self, parent, label):
+        super().__init__(title="Add Fingerprint", transient_for=parent, modal=True)
+        self.set_default_size(400, -1)
+        self.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        self.proc = None
+        self.failed = None
+
+        box = self.get_content_area()
+        box.set_spacing(12)
+        box.set_border_width(18)
+
+        self.heading = Gtk.Label(xalign=0)
+        self.heading.set_markup(
+            "<b>Touch the fingerprint sensor</b>"
+        )
+        box.add(self.heading)
+
+        self.detail = Gtk.Label(xalign=0, wrap=True)
+        self.detail.set_text(
+            "Lift and rest your finger repeatedly, shifting it slightly each "
+            "time so the edges get recorded."
+        )
+        self.detail.get_style_context().add_class("dim-label")
+        box.add(self.detail)
+
+        self.bar = Gtk.ProgressBar(show_text=True)
+        self.bar.set_text("0%")
+        box.add(self.bar)
+
+        self.show_all()
+        GLib.idle_add(self.start, label)
+
+    def start(self, label):
+        try:
+            launcher = Gio.SubprocessLauncher.new(
+                Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_MERGE
+            )
+            self.proc = launcher.spawnv([CLI, "add", label])
+        except GLib.Error as e:
+            self.fail(f"Could not start enrolment: {e.message}")
+            return False
+        stream = Gio.DataInputStream.new(self.proc.get_stdout_pipe())
+        self.read_line(stream)
+        return False
+
+    def read_line(self, stream):
+        stream.read_line_async(GLib.PRIORITY_DEFAULT, None, self.on_line, None)
+
+    def on_line(self, stream, result, _data):
+        try:
+            raw, _length = stream.read_line_finish(result)
+        except GLib.Error:
+            return
+        if raw is None:
+            self.finish()
+            return
+        line = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
+
+        m = PROGRESS.search(line)
+        if m:
+            fraction = int(m.group(1)) / 100
+            self.bar.set_fraction(fraction)
+            self.bar.set_text(f"{m.group(1)}%")
+        elif "Enroll complete" in line:
+            self.bar.set_fraction(1.0)
+            self.bar.set_text("100%")
+            self.heading.set_markup("<b>Fingerprint added</b>")
+            self.detail.set_text("")
+        elif "Try again" in line:
+            self.detail.set_text("That read was poor quality — try again.")
+        elif "already exists" in line:
+            self.failed = "A fingerprint with that name already exists."
+
+        self.read_line(stream)
+
+    def finish(self):
+        if self.proc is not None:
+            self.proc.wait(None)
+            if self.proc.get_exit_status() != 0 and self.failed is None:
+                self.failed = "Enrolment did not complete."
+        if self.failed:
+            self.fail(self.failed)
+        else:
+            self.response(Gtk.ResponseType.OK)
+
+    def fail(self, message):
+        self.failed = message
+        self.response(Gtk.ResponseType.REJECT)
+
+    def cancel_process(self):
+        if self.proc is not None and self.proc.get_identifier() is not None:
+            self.proc.force_exit()
+
+
+class FingerprintPanel(Gtk.Box):
+    def __init__(self, toplevel_getter):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=18)
+        self.set_border_width(18)
+        self.toplevel_getter = toplevel_getter
+        self.max_slots = max_templates() or 5
+
+        # Status banner
+        self.status = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        self.status_icon = Gtk.Image()
+        self.status_label = Gtk.Label(xalign=0, wrap=True)
+        self.status.pack_start(self.status_icon, False, False, 0)
+        self.status.pack_start(self.status_label, True, True, 0)
+        self.pack_start(self.status, False, False, 0)
+
+        # Enrolled fingerprints
+        frame = Gtk.Frame()
+        frame.set_shadow_type(Gtk.ShadowType.IN)
+        self.listbox = Gtk.ListBox()
+        self.listbox.set_selection_mode(Gtk.SelectionMode.NONE)
+        frame.add(self.listbox)
+        self.pack_start(frame, True, True, 0)
+
+        self.slots_label = Gtk.Label(xalign=0)
+        self.slots_label.get_style_context().add_class("dim-label")
+        self.pack_start(self.slots_label, False, False, 0)
+
+        buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.add_button = Gtk.Button.new_with_mnemonic("_Add Fingerprint…")
+        self.add_button.connect("clicked", self.on_add)
+        buttons.pack_start(self.add_button, False, False, 0)
+        self.pack_start(buttons, False, False, 0)
+
+        self.pack_start(Gtk.Separator(), False, False, 0)
+
+        # Unlock toggle
+        unlock_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        title = Gtk.Label(xalign=0)
+        title.set_markup("<b>Unlock the screen with your fingerprint</b>")
+        subtitle = Gtk.Label(xalign=0, wrap=True)
+        subtitle.set_text(
+            "Touch the sensor at the lock screen to unlock. Your password "
+            "keeps working as normal."
+        )
+        subtitle.get_style_context().add_class("dim-label")
+        text.pack_start(title, False, False, 0)
+        text.pack_start(subtitle, False, False, 0)
+        self.unlock_switch = Gtk.Switch(valign=Gtk.Align.CENTER)
+        self.unlock_handler = self.unlock_switch.connect(
+            "notify::active", self.on_unlock_toggled
+        )
+        unlock_row.pack_start(text, True, True, 0)
+        unlock_row.pack_start(self.unlock_switch, False, False, 0)
+        self.pack_start(unlock_row, False, False, 0)
+
+        self.refresh()
+
+    def refresh(self):
+        ready = sensor_ready()
+        if ready:
+            self.status_icon.set_from_icon_name(
+                pick_icon("emblem-ok-symbolic", "gtk-yes"), Gtk.IconSize.BUTTON
+            )
+            self.status_label.set_text("Fingerprint reader ready.")
+        else:
+            self.status_icon.set_from_icon_name(
+                pick_icon("dialog-warning-symbolic", "dialog-warning"),
+                Gtk.IconSize.BUTTON,
+            )
+            self.status_label.set_markup(
+                "Fingerprint service is not running.\n"
+                "<small>Start it with "
+                "<tt>sudo systemctl start rust-fp-dbus-interface</tt></small>"
+            )
+
+        for child in self.listbox.get_children():
+            self.listbox.remove(child)
+
+        names = list_fingerprints() if ready else []
+        if names is None:
+            names = []
+
+        if not names:
+            row = Gtk.ListBoxRow(activatable=False)
+            empty = Gtk.Label(
+                label="No fingerprints enrolled yet.", xalign=0.5, margin=18
+            )
+            empty.get_style_context().add_class("dim-label")
+            row.add(empty)
+            self.listbox.add(row)
+        else:
+            for name in names:
+                self.listbox.add(self.make_row(name))
+
+        used, total = len(names), self.max_slots
+        self.slots_label.set_text(f"{used} of {total} sensor slots used")
+        self.add_button.set_sensitive(ready and used < total)
+        self.listbox.show_all()
+
+        enabled, _ = systemctl_user("is-enabled", "--quiet", UNLOCK_UNIT)
+        with self.unlock_switch.handler_block(self.unlock_handler):
+            self.unlock_switch.set_active(enabled)
+        self.unlock_switch.set_sensitive(ready and bool(names))
+
+    def make_row(self, name):
+        row = Gtk.ListBoxRow(activatable=False)
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        box.set_border_width(8)
+        icon = Gtk.Image.new_from_icon_name(
+            pick_icon("fingerprint-symbolic", "auth-fingerprint-symbolic",
+                      "dialog-password"),
+            Gtk.IconSize.BUTTON,
+        )
+        box.pack_start(icon, False, False, 0)
+        box.pack_start(Gtk.Label(label=name, xalign=0), True, True, 0)
+        remove = Gtk.Button.new_from_icon_name(
+            pick_icon("user-trash-symbolic", "edit-delete"), Gtk.IconSize.BUTTON
+        )
+        remove.set_tooltip_text(f"Remove “{name}”")
+        remove.get_style_context().add_class("flat")
+        remove.connect("clicked", self.on_remove, name)
+        box.pack_start(remove, False, False, 0)
+        row.add(box)
+        return row
+
+    def error(self, message):
+        dialog = Gtk.MessageDialog(
+            transient_for=self.toplevel_getter(),
+            modal=True,
+            message_type=Gtk.MessageType.ERROR,
+            buttons=Gtk.ButtonsType.CLOSE,
+            text="Fingerprint error",
+        )
+        dialog.format_secondary_text(message)
+        dialog.run()
+        dialog.destroy()
+
+    def on_add(self, _button):
+        existing = list_fingerprints() or []
+        suggestion = f"Finger {len(existing) + 1}"
+
+        ask = Gtk.Dialog(
+            title="Add Fingerprint",
+            transient_for=self.toplevel_getter(),
+            modal=True,
+        )
+        ask.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        start = ask.add_button("Continue", Gtk.ResponseType.OK)
+        start.get_style_context().add_class("suggested-action")
+        ask.set_default_response(Gtk.ResponseType.OK)
+
+        content = ask.get_content_area()
+        content.set_spacing(12)
+        content.set_border_width(18)
+        content.add(Gtk.Label(label="Name this fingerprint:", xalign=0))
+        entry = Gtk.Entry(text=suggestion, activates_default=True)
+        content.add(entry)
+        ask.show_all()
+
+        response = ask.run()
+        label = entry.get_text().strip()
+        ask.destroy()
+        if response != Gtk.ResponseType.OK:
+            return
+
+        if not VALID_LABEL.match(label):
+            self.error(
+                "Please use a short name made of letters, numbers, spaces, "
+                "brackets, dashes or underscores."
+            )
+            return
+        if label in existing:
+            self.error("A fingerprint with that name already exists.")
+            return
+
+        enroll = EnrollDialog(self.toplevel_getter(), label)
+        result = enroll.run()
+        if result not in (Gtk.ResponseType.OK, Gtk.ResponseType.REJECT):
+            enroll.cancel_process()
+        message = enroll.failed
+        enroll.destroy()
+        if result == Gtk.ResponseType.REJECT and message:
+            self.error(message)
+        self.refresh()
+
+    def on_remove(self, _button, name):
+        confirm = Gtk.MessageDialog(
+            transient_for=self.toplevel_getter(),
+            modal=True,
+            message_type=Gtk.MessageType.QUESTION,
+            buttons=Gtk.ButtonsType.OK_CANCEL,
+            text=f"Remove “{name}”?",
+        )
+        confirm.format_secondary_text(
+            "You will no longer be able to unlock the screen with this finger."
+        )
+        response = confirm.run()
+        confirm.destroy()
+        if response != Gtk.ResponseType.OK:
+            return
+        ok, out = cli("remove", name)
+        if not ok:
+            self.error(out or "Could not remove the fingerprint.")
+        self.refresh()
+
+    def on_unlock_toggled(self, switch, _param):
+        if switch.get_active():
+            ok, out = systemctl_user("enable", "--now", UNLOCK_UNIT)
+        else:
+            ok, out = systemctl_user("disable", "--now", UNLOCK_UNIT)
+        if not ok:
+            self.error(out or "Could not change the unlock setting.")
+            self.refresh()
+
+
+def main():
+    socket_id = None
+    args = sys.argv[1:]
+    for i, arg in enumerate(args):
+        if arg == "--socket-id" and i + 1 < len(args):
+            socket_id = int(args[i + 1])
+        elif arg.startswith("--socket-id="):
+            socket_id = int(arg.split("=", 1)[1])
+
+    if socket_id:
+        # Embedded inside the XFCE Settings Manager window.
+        plug = Gtk.Plug.new(socket_id)
+        panel = FingerprintPanel(lambda: plug.get_toplevel())
+        plug.add(panel)
+        plug.connect("destroy", Gtk.main_quit)
+        plug.show_all()
+    else:
+        window = Gtk.Window(title="Fingerprint")
+        window.set_default_size(480, 460)
+        window.set_icon_name(
+            pick_icon("fingerprint", "auth-fingerprint-symbolic", "dialog-password")
+        )
+        panel = FingerprintPanel(lambda: window)
+        window.add(panel)
+        window.connect("destroy", Gtk.main_quit)
+        window.show_all()
+
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    main()
