@@ -13,7 +13,12 @@ use zbus::export::futures_util::future::join_all;
 
 #[async_std::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    SimpleLogger::new().init().unwrap();
+    // Without a level SimpleLogger logs at Trace, which buries every useful
+    // line under async-io internals and writes megabytes to the journal.
+    SimpleLogger::new()
+        .with_level(log::LevelFilter::Info)
+        .init()
+        .unwrap();
     info!("Checking compatible fingerprint drivers");
     let drivers = get_drivers();
     let compatibilities = join_all(
@@ -94,7 +99,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             "/org/rust_fp/RustFp",
             RustFp {
                 driver,
-                enrolling_id: Default::default(),
+                enrolling: Default::default(),
             },
         )?
         .build()

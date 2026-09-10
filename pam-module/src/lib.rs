@@ -71,7 +71,8 @@ impl PamHooks for RustFpPam {
                             let proxy = RustFpProxyBlocking::new(&connection).unwrap();
                             let templates_vec = templates.iter().collect::<Vec<_>>();
                             let max_attempts = 5;
-                            for attempt in 0..max_attempts {
+                            let mut attempt = 0;
+                            while attempt < max_attempts {
                                 let output: MatchOutput = from_bytes(
                                     &proxy
                                         .match_templates(
@@ -101,8 +102,14 @@ impl PamHooks for RustFpPam {
                                         }
                                         return PAM_SUCCESS;
                                     }
+                                    // The daemon hands the sensor back
+                                    // periodically so that enrolling can get a
+                                    // turn. Nothing was decided, so this must
+                                    // not use up an attempt.
+                                    MatchOutput::TimedOut => continue,
                                     MatchOutput::NoMatch(error) => {
                                         let remaining_attempts = max_attempts - attempt - 1;
+                                        attempt += 1;
                                         tx.send(Message::Error(format!(
                                             "No match. {remaining_attempts} attempts remaining."
                                         )))

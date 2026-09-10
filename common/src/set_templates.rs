@@ -54,9 +54,15 @@ pub async fn set_templates(templates: &Templates) -> Result<(), Error> {
     let mut file = OpenOptions::new()
         .write(true)
         .create(true)
+        // Without truncating, a shorter set of templates leaves the tail of the
+        // longer one it replaced behind — removing a fingerprint would write a
+        // valid record followed by trailing garbage.
+        .truncate(true)
         .open(get_fp_file().map_err(Error::FpFile)?)
         .await
         .map_err(Error::Open)?;
-    file.write(&vec).await.map_err(Error::Write)?;
+    // write() may write only part of the buffer.
+    file.write_all(&vec).await.map_err(Error::Write)?;
+    file.flush().await.map_err(Error::Write)?;
     Ok(())
 }

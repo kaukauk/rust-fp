@@ -1,5 +1,7 @@
 use async_std::{io::stdout, main};
 use std::error::Error;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use postcard::from_bytes;
@@ -22,6 +24,8 @@ struct Cli {
 enum Commands {
     /// Get the maximum number of templates that the fingerprint sensor can have stored
     GetMaxTemplates,
+    /// Print sensor and host-command details. Include this in bug reports.
+    Info,
     Add {
         label: String,
     },
@@ -49,46 +53,65 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let max_templates = proxy.get_max_templates().await?;
             println!("Max templates: {max_templates}");
         }
+        Commands::Info => {
+            let connection = Connection::system().await?;
+            let proxy = RustFpProxy::new(&connection).await?;
+            print!("{}", proxy.get_info().await?);
+        }
         Commands::Add { label } => {
             let mut templates = get_templates().await?;
-            match templates.contains_key(&label) {
-                false => {
-                    let connection = Connection::system().await?;
-                    let proxy = RustFpProxy::new(&connection).await?;
-                    let mut id = None;
-                    let template = loop {
-                        println!("Touch the FP sensor");
-                        // FIXME: Don't exit if there is a LowQuality error. Just do the enroll step again.
-                        let output = loop {
-                            let output: EnrollStepDbusOutput =
-                                from_bytes(&proxy.enroll_step(id.unwrap_or_default()).await?)?;
-                            id = Some(output.id);
-                            match output.result {
-                                Ok(output) => {
-                                    break output;
-                                }
-                                Err(error) => {
-                                    println!("{error:?}. Try again.");
-                                }
-                            }
-                        };
-                        match output {
-                            EnrollStepOutput::InProgress(percentage) => {
-                                println!("Enroll progress: {percentage}%");
-                            }
-                            EnrollStepOutput::Complete(template) => {
-                                break template;
-                            }
-                        }
-                    };
-                    println!("Enroll complete");
-                    templates.insert(label, template);
-                    set_templates(&templates).await?;
-                    println!("Saved template to file");
-                    Ok(())
+            if templates.contains_key(&label) {
+                Err("A fingerprint with that label already exists")?;
+            }
+            let connection = Connection::system().await?;
+            let proxy = RustFpProxy::new(&connection).await?;
+
+            // Enrolling owns the sensor, and nothing else — matching included —
+            // can use it until the enrolment ends. Dying without a word leaves
+            // the daemon to time the session out, so hand it back on the way
+            // out instead.
+            let cancelled = Arc::new(AtomicBool::new(false));
+            {
+                let cancelled = cancelled.clone();
+                // A handler already being set is not worth failing over.
+                let _ = ctrlc::set_handler(move || cancelled.store(true, Ordering::SeqCst));
+            }
+
+            let mut id = None;
+            let mut last_percentage = None;
+            println!("Touch the FP sensor");
+            let template = loop {
+                if cancelled.load(Ordering::SeqCst) {
+                    if let Some(id) = id {
+                        proxy.cancel_enroll(id).await?;
+                    }
+                    println!("Enroll cancelled");
+                    return Ok(());
                 }
-                true => Err("A fingerprint with that label already exists"),
-            }?;
+                let output: EnrollStepDbusOutput =
+                    from_bytes(&proxy.enroll_step(id.unwrap_or_default()).await?)?;
+                id = Some(output.id);
+                match output.result {
+                    Err(error) => {
+                        println!("{error:?}. Try again.");
+                    }
+                    // Nobody has touched the sensor yet. Steps are deliberately
+                    // bounded so the daemon stays usable; just ask again.
+                    Ok(EnrollStepOutput::TimedOut) => {}
+                    Ok(EnrollStepOutput::InProgress(percentage)) => {
+                        if last_percentage != Some(percentage) {
+                            last_percentage = Some(percentage);
+                            println!("Enroll progress: {percentage}%");
+                            println!("Touch the FP sensor");
+                        }
+                    }
+                    Ok(EnrollStepOutput::Complete(template)) => break template,
+                }
+            };
+            println!("Enroll complete");
+            templates.insert(label, template);
+            set_templates(&templates).await?;
+            println!("Saved template to file");
         }
         Commands::List => {
             let templates = get_templates().await?;
@@ -119,17 +142,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 let connection = Connection::system().await?;
                 let proxy = RustFpProxy::new(&connection).await?;
                 let templates_vec = templates.iter().collect::<Vec<_>>();
+                let payload = templates_vec
+                    .iter()
+                    .map::<Vec<u8>, _>(|(_k, v)| v.to_vec())
+                    .collect::<Vec<_>>();
                 println!("Ready to match...");
-                let output: MatchOutput = from_bytes(
-                    &proxy
-                        .match_templates(
-                            templates_vec
-                                .iter()
-                                .map::<Vec<u8>, _>(|(_k, v)| v.to_vec())
-                                .collect(),
-                        )
-                        .await?,
-                )?;
+                let output: MatchOutput = loop {
+                    let output: MatchOutput =
+                        from_bytes(&proxy.match_templates(payload.clone()).await?)?;
+                    // Matching is bounded for the same reason enrolling is.
+                    if !matches!(output, MatchOutput::TimedOut) {
+                        break output;
+                    }
+                };
                 println!("Output: {output:?}");
                 match output {
                     MatchOutput::Match(MatchedOutput {
@@ -140,7 +165,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         println!("Matched: {matched_label}.");
                         if let Some(updated_template) = updated_template {
                             println!("Template was updated. Saving updated template...");
-                            templates.insert(matched_label.to_owned(), updated_template);
+                            let matched_label = matched_label.to_owned();
+                            templates.insert(matched_label, updated_template);
                             set_templates(&templates).await?;
                             println!("Saved updated template");
                         }
@@ -151,6 +177,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             println!("Error matching: {error:?}");
                         }
                     }
+                    MatchOutput::TimedOut => unreachable!("looped until a decision"),
                 }
             } else {
                 println!("No templates saved. Not matching.");
