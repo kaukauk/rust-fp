@@ -11,6 +11,7 @@ own window, the same way the stock dialogs behave.
 
 import re
 import shutil
+import signal
 import sys
 import subprocess
 
@@ -90,23 +91,40 @@ def pick_icon(*names):
 
 
 class EnrollDialog(Gtk.Dialog):
-    """Runs `rust-fp add <label>` and mirrors its progress."""
+    """Runs `rust-fp add <label>` and mirrors its progress.
+
+    Deliberately does not use `Gtk.Dialog.run()`. Enrolment holds the sensor,
+    and the CLI hands it back when it is asked to stop, so the dialog has to
+    stay up until the process is actually gone rather than vanish the moment
+    Cancel is clicked.
+    """
+
+    # How long to let `rust-fp` shut down cleanly before killing it. It only has
+    # to tell the daemon to drop the enrolment, which is one D-Bus call.
+    KILL_AFTER_SECONDS = 5
 
     def __init__(self, parent, label):
         super().__init__(title="Add Fingerprint", transient_for=parent, modal=True)
         self.set_default_size(400, -1)
-        self.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        self.cancel_button = self.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        self.label = label
         self.proc = None
         self.failed = None
+        self.cancelled = False
+        self.completed = False
+        self.stream_done = False
+        self.proc_done = False
+        self.kill_timer = None
+        self.step = None
+        self.loop = GLib.MainLoop()
+        self.outcome = Gtk.ResponseType.REJECT
 
         box = self.get_content_area()
         box.set_spacing(12)
         box.set_border_width(18)
 
         self.heading = Gtk.Label(xalign=0)
-        self.heading.set_markup(
-            "<b>Touch the fingerprint sensor</b>"
-        )
+        self.heading.set_markup("<b>Touch the fingerprint sensor</b>")
         box.add(self.heading)
 
         self.detail = Gtk.Label(xalign=0, wrap=True)
@@ -121,18 +139,33 @@ class EnrollDialog(Gtk.Dialog):
         self.bar.set_text("0%")
         box.add(self.bar)
 
-        self.show_all()
-        GLib.idle_add(self.start, label)
+        # Cancel and the window's X both mean "stop", not "disappear".
+        self.connect("response", self.on_response)
+        self.connect("delete-event", self.on_delete)
 
-    def start(self, label):
+    def run_enroll(self):
+        """Show the dialog and pump it until enrolment ends. Returns a response."""
+        self.show_all()
+        GLib.idle_add(self.start)
+        self.loop.run()
+        return self.outcome
+
+    # -- process plumbing --------------------------------------------------
+
+    def start(self):
         try:
             launcher = Gio.SubprocessLauncher.new(
                 Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_MERGE
             )
-            self.proc = launcher.spawnv([CLI, "add", label])
+            self.proc = launcher.spawnv([CLI, "add", self.label])
         except GLib.Error as e:
             self.fail(f"Could not start enrolment: {e.message}")
             return False
+        if self.cancelled:
+            # Cancelled while we were still starting up.
+            self.stop_process()
+            return False
+        self.proc.wait_async(None, self.on_proc_exit, None)
         stream = Gio.DataInputStream.new(self.proc.get_stdout_pipe())
         self.read_line(stream)
         return False
@@ -144,18 +177,50 @@ class EnrollDialog(Gtk.Dialog):
         try:
             raw, _length = stream.read_line_finish(result)
         except GLib.Error:
+            self.stream_done = True
+            self.maybe_finish()
             return
-        if raw is None:
-            self.finish()
+        # PyGObject hands back an empty bytes object at end of stream, not None.
+        # Testing for None here meant the end was never recognised: the dialog
+        # sat at 100% and re-armed the read forever, pinning the GTK main loop
+        # so the window could not repaint or answer a click.
+        if not raw:
+            self.stream_done = True
+            self.maybe_finish()
             return
         line = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
+        self.on_output(line)
+        self.read_line(stream)
 
+    def on_proc_exit(self, proc, result, _data):
+        try:
+            proc.wait_finish(result)
+        except GLib.Error:
+            pass
+        self.proc_done = True
+        self.maybe_finish()
+
+    def on_output(self, line):
         m = PROGRESS.search(line)
         if m:
-            fraction = int(m.group(1)) / 100
-            self.bar.set_fraction(fraction)
-            self.bar.set_text(f"{m.group(1)}%")
+            percentage = int(m.group(1))
+            self.bar.set_fraction(percentage / 100)
+            self.bar.set_text(f"{percentage}%")
+            # The sensor works in fixed steps, so the first one says how many
+            # touches the whole enrolment takes. Derived rather than assumed, in
+            # case a different sensor uses a different step.
+            if self.step is None and percentage > 0:
+                self.step = percentage
+            if self.step:
+                done = round(percentage / self.step)
+                total = round(100 / self.step)
+                self.heading.set_markup(f"<b>Scan {done} of {total} done</b>")
+            self.detail.set_text(
+                "Lift your finger, then touch the sensor again, shifting it "
+                "slightly so the edges get recorded."
+            )
         elif "Enroll complete" in line:
+            self.completed = True
             self.bar.set_fraction(1.0)
             self.bar.set_text("100%")
             self.heading.set_markup("<b>Fingerprint added</b>")
@@ -164,26 +229,76 @@ class EnrollDialog(Gtk.Dialog):
             self.detail.set_text("That read was poor quality — try again.")
         elif "already exists" in line:
             self.failed = "A fingerprint with that name already exists."
+        elif "in the middle of enrolling" in line:
+            self.failed = (
+                "Another program is already enrolling a fingerprint. "
+                "Wait for it to finish and try again."
+            )
 
-        self.read_line(stream)
+    # -- stopping ----------------------------------------------------------
 
-    def finish(self):
-        if self.proc is not None:
-            self.proc.wait(None)
-            if self.proc.get_exit_status() != 0 and self.failed is None:
-                self.failed = "Enrolment did not complete."
-        if self.failed:
-            self.fail(self.failed)
+    def on_response(self, _dialog, response):
+        if response == Gtk.ResponseType.CANCEL:
+            self.begin_cancel()
+
+    def on_delete(self, _widget, _event):
+        self.begin_cancel()
+        # Keep the window up until the enrolment has actually been handed back.
+        return True
+
+    def begin_cancel(self):
+        if self.cancelled or self.completed:
+            return
+        self.cancelled = True
+        self.cancel_button.set_sensitive(False)
+        self.heading.set_markup("<b>Cancelling…</b>")
+        self.detail.set_text("Releasing the fingerprint sensor.")
+        self.stop_process()
+
+    def stop_process(self):
+        if self.proc is None or self.proc.get_identifier() is None:
+            self.proc_done = True
+            self.stream_done = True
+            self.maybe_finish()
+            return
+        # SIGTERM rather than a kill: the CLI catches it and tells the daemon to
+        # drop the enrolment. Killing it outright leaves the sensor reserved,
+        # which is what used to stop fingerprint unlock working afterwards.
+        self.proc.send_signal(signal.SIGTERM)
+        self.kill_timer = GLib.timeout_add_seconds(
+            self.KILL_AFTER_SECONDS, self.force_kill
+        )
+
+    def force_kill(self):
+        self.kill_timer = None
+        if self.proc is not None and self.proc.get_identifier() is not None:
+            self.proc.force_exit()
+        return False
+
+    def maybe_finish(self):
+        if not (self.stream_done and self.proc_done):
+            return
+        if self.kill_timer is not None:
+            GLib.source_remove(self.kill_timer)
+            self.kill_timer = None
+        if self.cancelled and not self.completed:
+            self.outcome = Gtk.ResponseType.CANCEL
+        elif self.completed and self.failed is None:
+            self.outcome = Gtk.ResponseType.OK
         else:
-            self.response(Gtk.ResponseType.OK)
+            if self.failed is None:
+                self.failed = "Enrolment did not complete."
+            self.outcome = Gtk.ResponseType.REJECT
+        self.quit()
 
     def fail(self, message):
         self.failed = message
-        self.response(Gtk.ResponseType.REJECT)
+        self.outcome = Gtk.ResponseType.REJECT
+        self.quit()
 
-    def cancel_process(self):
-        if self.proc is not None and self.proc.get_identifier() is not None:
-            self.proc.force_exit()
+    def quit(self):
+        if self.loop.is_running():
+            self.loop.quit()
 
 
 class FingerprintPanel(Gtk.Box):
@@ -363,9 +478,7 @@ class FingerprintPanel(Gtk.Box):
             return
 
         enroll = EnrollDialog(self.toplevel_getter(), label)
-        result = enroll.run()
-        if result not in (Gtk.ResponseType.OK, Gtk.ResponseType.REJECT):
-            enroll.cancel_process()
+        result = enroll.run_enroll()
         message = enroll.failed
         enroll.destroy()
         if result == Gtk.ResponseType.REJECT and message:
